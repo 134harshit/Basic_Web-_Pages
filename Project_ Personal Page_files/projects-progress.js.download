@@ -1,0 +1,582 @@
+(function () {
+  if (window.ProjectsProgress) {
+    return;
+  }
+
+  var SESSION_STATE_VERSION = 2;
+  var PROGRESS_SCHEMA_VERSION = 2;
+
+  function safeJsonParse(raw) {
+    try {
+      return JSON.parse(raw);
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  function fileTextChecksum(text) {
+    if (typeof text !== 'string') {
+      return '';
+    }
+    var h = 0;
+    for (var i = 0; i < text.length; i++) {
+      h = ((h << 5) - h + text.charCodeAt(i)) | 0;
+    }
+    return (h >>> 0).toString(16).padStart(8, '0');
+  }
+
+  var ProjectsProgress = {
+    _config: null,
+    _storageKey: '',
+    _currentStep: 0,
+    _awaitingContinue: false,
+    _fileStates: {},
+    _stepChangeDeltas: {},
+    _stepBaselineChecksums: null,
+    _hintsUsed: {},
+    _hintViewedBeforeStepCheck: false,
+    _finishModalDismissed: false,
+    _welcomeHidden: false,
+    _bootstrapped: false,
+    _backendLoginFetchScheduled: false,
+
+    init: function (config) {
+      this._config = config || {};
+      this._storageKey = 'w3schools.projects.' + (config.projectCode || 'unknown');
+      this._currentStep = 0;
+      this._awaitingContinue = false;
+      this._fileStates = {};
+      this._stepChangeDeltas = {};
+      this._hintsUsed = {};
+      this._hintViewedBeforeStepCheck = false;
+      this._stepBaselineChecksums = this._captureBaselineChecksums();
+      this._bindHintTracking();
+      this.bootstrapState();
+    },
+
+    uiStep: function () {
+      return this._currentStep + 1;
+    },
+
+    _projectId: function () {
+      return String(this._config.projectCode || '').toLowerCase();
+    },
+
+    _captureBaselineChecksums: function () {
+      var files = this._getFiles();
+      var baseline = {};
+      (this._config.fileNames || []).forEach(function (fileId) {
+        baseline[fileId] = fileTextChecksum(files[fileId] || '');
+      });
+      return baseline;
+    },
+
+    _getFiles: function () {
+      if (typeof this._config.getFiles === 'function') {
+        return this._config.getFiles() || {};
+      }
+      return {};
+    },
+
+    _setFiles: function (files) {
+      if (typeof this._config.setFiles === 'function') {
+        this._config.setFiles(files || {});
+      }
+    },
+
+    _stepCount: function () {
+      return Math.max(0, parseInt(this._config.stepCount, 10) || 0);
+    },
+
+    isProjectCompleted: function () {
+      return this._currentStep >= this._stepCount();
+    },
+
+    _bindHintTracking: function () {
+      document.querySelectorAll('.step-hint-details').forEach(function (el) {
+        el.addEventListener('toggle', function () {
+          if (!el.open || ProjectsProgress._awaitingContinue) {
+            return;
+          }
+          var pane = el.closest('[data-step-pane]');
+          if (!pane) {
+            return;
+          }
+          var paneStep = parseInt(pane.getAttribute('data-step-pane'), 10);
+          if (paneStep === ProjectsProgress.uiStep()) {
+            ProjectsProgress._hintViewedBeforeStepCheck = true;
+          }
+        });
+      });
+    },
+
+    _recordStepHintUsage: function (stepIndex) {
+      if (this._hintViewedBeforeStepCheck) {
+        this._hintsUsed[String(stepIndex)] = true;
+      }
+      this._hintViewedBeforeStepCheck = false;
+    },
+
+    _pruneHintsFromStep: function (fromStep) {
+      for (var i = fromStep; i < this._stepCount(); i++) {
+        delete this._hintsUsed[String(i)];
+      }
+      this._hintViewedBeforeStepCheck = false;
+    },
+
+    _getWireHintsUsed: function () {
+      var hintsUsed = Object.assign({}, this._hintsUsed);
+      if (this._awaitingContinue) {
+        delete hintsUsed[String(this._currentStep)];
+      }
+      return hintsUsed;
+    },
+
+    _readSessionState: function () {
+      if (!window.sessionStorage) {
+        return null;
+      }
+      return safeJsonParse(window.sessionStorage.getItem(this._storageKey));
+    },
+
+    saveState: function () {
+      if (!window.sessionStorage) {
+        return;
+      }
+      try {
+        window.sessionStorage.setItem(this._storageKey, JSON.stringify({
+          version: SESSION_STATE_VERSION,
+          progressSchemaVersion: PROGRESS_SCHEMA_VERSION,
+          currentStep: this._currentStep,
+          awaitingContinue: this._awaitingContinue,
+          fileStates: this._fileStates,
+          stepChangeDeltas: this._stepChangeDeltas,
+          hintsUsed: this._hintsUsed,
+          finishModalDismissed: this._finishModalDismissed,
+          welcomeHidden: this._welcomeHidden
+        }));
+      } catch (_e) {
+        // ignore quota errors
+      }
+    },
+
+    clearSavedState: function () {
+      if (!window.sessionStorage) {
+        return;
+      }
+      try {
+        window.sessionStorage.removeItem(this._storageKey);
+      } catch (_e) {
+        // ignore
+      }
+    },
+
+    _applyStoredState: function (state) {
+      if (!state || (Number(state.progressSchemaVersion) || 0) < PROGRESS_SCHEMA_VERSION) {
+        return false;
+      }
+
+      this._currentStep = Math.max(0, Math.min(Number(state.currentStep) || 0, this._stepCount()));
+      this._awaitingContinue = !!state.awaitingContinue;
+      this._fileStates = Object.assign({}, state.fileStates || {});
+      this._stepChangeDeltas = Object.assign({}, state.stepChangeDeltas || {});
+      this._hintsUsed = Object.assign({}, state.hintsUsed || {});
+      this._finishModalDismissed = !!state.finishModalDismissed;
+      this._welcomeHidden = !!state.welcomeHidden;
+      this._applyFileSnapshotsToEditor(this._fileStates);
+      return true;
+    },
+
+    _applyBackendCompletion: function (completion) {
+      if (!completion || (Number(completion.version) || 0) < PROGRESS_SCHEMA_VERSION) {
+        return false;
+      }
+      // If a Reset is still pending acknowledgement, the backend will keep
+      // returning the pre-reset completion state. Don't apply it — that
+      // would snap the user back to the finished state with old files.
+      if (this._isResetPending()) {
+        return false;
+      }
+
+      this._currentStep = Math.max(0, Math.min(Number(completion.currentStep) || 0, this._stepCount()));
+      this._awaitingContinue = !!completion.awaitingContinue;
+      this._finishModalDismissed = !!completion.finishModalDismissed;
+      this._welcomeHidden = !!completion.welcomeHidden;
+      this._stepChangeDeltas = Object.assign({}, completion.stepChangeDeltas || {});
+      this._hintsUsed = Object.assign({}, completion.hintsUsed || {});
+
+      this._fileStates = {};
+      var snapshots = completion.fileSnapshots;
+      if (snapshots && typeof snapshots === 'object') {
+        Object.keys(snapshots).forEach(function (fileId) {
+          var entry = snapshots[fileId];
+          if (!entry || typeof entry.codeSnapshot !== 'string') {
+            return;
+          }
+          ProjectsProgress._fileStates[fileId] = {
+            codeSnapshot: entry.codeSnapshot
+          };
+        });
+      }
+
+      if (completion.completed === true && this._currentStep < this._stepCount()) {
+        this._currentStep = this._stepCount();
+        this._awaitingContinue = false;
+      }
+
+      this._applyFileSnapshotsToEditor(this._fileStates);
+      this.saveState();
+      return true;
+    },
+
+    _applyFileSnapshotsToEditor: function (fileStates) {
+      if (!fileStates || typeof fileStates !== 'object') {
+        return;
+      }
+      var files = {};
+      var hasSnapshot = false;
+      (this._config.fileNames || []).forEach(function (fileId) {
+        var entry = fileStates[fileId];
+        if (entry && typeof entry.codeSnapshot === 'string') {
+          files[fileId] = entry.codeSnapshot;
+          hasSnapshot = true;
+        }
+      });
+      if (hasSnapshot) {
+        this._setFiles(files);
+      }
+    },
+
+    _shouldFetchBackendState: function () {
+      return !!(window.MyLearning
+        && typeof window.MyLearning.fetchProjectProgress === 'function'
+        && window.UserSession
+        && window.UserSession.loggedIn === true);
+    },
+
+    _syncUiStep: function () {
+      if (typeof this._config.syncUiStep === 'function') {
+        this._config.syncUiStep(this.uiStep());
+      } else if (typeof this._config.gotoStep === 'function') {
+        this._config.gotoStep(this.uiStep());
+      }
+    },
+
+    _finishBootstrap: function () {
+      this._bootstrapped = true;
+      this._refreshStepBaseline();
+      if (typeof this._config.onBootstrapComplete === 'function') {
+        this._config.onBootstrapComplete();
+      }
+    },
+
+    bootstrapState: function () {
+      var self = this;
+
+      if (this._shouldFetchBackendState()) {
+        this._fetchBackendProgress(function (hydrated) {
+          if (!hydrated) {
+            self._applyStoredState(self._readSessionState());
+          }
+          self._syncUiStep();
+          self._finishBootstrap();
+        });
+        return;
+      }
+
+      this._applyStoredState(this._readSessionState());
+      this._syncUiStep();
+      this._scheduleLoginFetch();
+      this._finishBootstrap();
+    },
+
+    _scheduleLoginFetch: function () {
+      var self = this;
+      if (this._backendLoginFetchScheduled || !window.Util || typeof window.Util.objFieldOnSetCallback !== 'function') {
+        return;
+      }
+      if (typeof window.UserSession === 'undefined') {
+        return;
+      }
+      this._backendLoginFetchScheduled = true;
+      window.Util.objFieldOnSetCallback({
+        scopeRef: window.UserSession,
+        fieldName: 'loggedIn',
+        treatNullAsUnset: true,
+        callback: function (res) {
+          if (!res || !res.error || res.error.code !== '0' || window.UserSession.loggedIn !== true) {
+            return;
+          }
+          if (!self._shouldFetchBackendState()) {
+            return;
+          }
+          self._fetchBackendProgress(function (hydrated) {
+            if (!hydrated) {
+              return;
+            }
+            self._syncUiStep();
+            if (typeof self._config.onBootstrapComplete === 'function') {
+              self._config.onBootstrapComplete();
+            }
+          });
+        }
+      });
+    },
+
+    _fetchBackendProgress: function (callback) {
+      var self = this;
+      window.MyLearning.fetchProjectProgress({ projectId: this._projectId() }, function (res) {
+        var hydrated = false;
+        if (res && res.error && res.error.code === '0' && res.data && res.data.completion) {
+          hydrated = self._applyBackendCompletion(res.data.completion);
+        }
+        if (typeof callback === 'function') {
+          callback(hydrated);
+        }
+      });
+    },
+
+    _refreshStepBaseline: function () {
+      this._stepBaselineChecksums = this._captureBaselineChecksums();
+    },
+
+    onStepActivated: function (uiStepNumber) {
+      var step = Math.max(0, (parseInt(uiStepNumber, 10) || 1) - 1);
+      this._pruneHintsFromStep(step);
+      this._currentStep = step;
+      this._awaitingContinue = false;
+      this._refreshStepBaseline();
+    },
+
+    _buildFileSnapshots: function (includeDelta) {
+      var files = this._getFiles();
+      var snapshots = {};
+      var baseline = this._stepBaselineChecksums || {};
+
+      (this._config.fileNames || []).forEach(function (fileId) {
+        var snapshot = typeof files[fileId] === 'string' ? files[fileId] : '';
+        var entry = { codeSnapshot: snapshot };
+        if (includeDelta) {
+          var endChecksum = fileTextChecksum(snapshot);
+          var startChecksum = baseline[fileId];
+          if (startChecksum && startChecksum !== endChecksum) {
+            entry.changeDelta = {
+              version: 1,
+              startChecksum: startChecksum,
+              endChecksum: endChecksum,
+              changes: []
+            };
+          }
+        }
+        snapshots[fileId] = entry;
+      });
+
+      return snapshots;
+    },
+
+    _buildPrefillSnapshots: function () {
+      var initialFiles = this._config.initialFiles || {};
+      var snapshots = {};
+      (this._config.fileNames || []).forEach(function (fileId) {
+        snapshots[fileId] = { codeSnapshot: initialFiles[fileId] || '' };
+      });
+      return snapshots;
+    },
+
+    _serializeFileStates: function (snapshots) {
+      var fileStates = {};
+      Object.keys(snapshots).forEach(function (fileId) {
+        fileStates[fileId] = { codeSnapshot: snapshots[fileId].codeSnapshot };
+      });
+      this._fileStates = fileStates;
+    },
+
+    _storeLocalStepDeltas: function (stepIndex, snapshots) {
+      var stepKey = String(stepIndex);
+      var stepDeltas = {};
+      var hasDelta = false;
+      Object.keys(snapshots).forEach(function (fileId) {
+        if (snapshots[fileId].changeDelta) {
+          stepDeltas[fileId] = snapshots[fileId].changeDelta;
+          hasDelta = true;
+        }
+      });
+      if (hasDelta) {
+        this._stepChangeDeltas[stepKey] = stepDeltas;
+      }
+    },
+
+    _buildPayload: function (options) {
+      options = options || {};
+      var payload = {
+        projectId: this._projectId(),
+        version: PROGRESS_SCHEMA_VERSION,
+        currentStep: this._currentStep,
+        awaitingContinue: this._awaitingContinue
+      };
+
+      if (options.completed === true) {
+        payload.completed = true;
+      } else if (options.completed === false) {
+        // Explicit reset: tell the backend to clear its completion flag.
+        // Otherwise stale completion: true would override the local reset
+        // on the next F5 (phantom revert to finished state).
+        payload.completed = false;
+      }
+      if (options.reset === true) {
+        payload.reset = true;
+      }
+      if (typeof options.submittedStep === 'number') {
+        payload.submittedStep = options.submittedStep;
+      }
+      if (this._finishModalDismissed) {
+        payload.finishModalDismissed = true;
+      }
+      if (this._welcomeHidden) {
+        payload.welcomeHidden = true;
+      }
+      if (Object.prototype.hasOwnProperty.call(options, 'fileSnapshots')) {
+        payload.fileSnapshots = options.fileSnapshots;
+      }
+
+      var hintsUsed = this._getWireHintsUsed();
+      if (Object.keys(hintsUsed).length > 0) {
+        payload.hintsUsed = hintsUsed;
+      }
+
+      return payload;
+    },
+
+    submitProgress: function (options, callback) {
+      if (!window.MyLearning || typeof window.MyLearning.submitProjectProgress !== 'function') {
+        if (typeof callback === 'function') {
+          callback(null);
+        }
+        return;
+      }
+      if (this.isProjectCompleted() && !(options && options.completed === true)) {
+        if (typeof callback === 'function') {
+          callback(null);
+        }
+        return;
+      }
+      window.MyLearning.submitProjectProgress(this._buildPayload(options), callback);
+    },
+
+    onCheckPassed: function () {
+      var snapshots = this._buildFileSnapshots(true);
+      this._serializeFileStates(snapshots);
+      this._storeLocalStepDeltas(this._currentStep, snapshots);
+      this._awaitingContinue = true;
+      this.saveState();
+      this.submitProgress({
+        fileSnapshots: snapshots,
+        submittedStep: this._currentStep
+      });
+    },
+
+    onContinue: function (options) {
+      options = options || {};
+      if (this._awaitingContinue) {
+        this._recordStepHintUsage(this._currentStep);
+      }
+      this._awaitingContinue = false;
+
+      if (options.isFinal) {
+        this._currentStep = this._stepCount();
+        this._finishModalDismissed = false;
+        this.saveState();
+        this.submitProgress({
+          completed: true,
+          fileSnapshots: this._buildFileSnapshots(false)
+        });
+        return;
+      }
+
+      this._currentStep = Math.min(this._currentStep + 1, this._stepCount() - 1);
+      this._refreshStepBaseline();
+      this.saveState();
+      this.submitProgress({ fileSnapshots: this._buildFileSnapshots(false) });
+    },
+
+    onFinish: function () {
+      this.onContinue({ isFinal: true });
+    },
+
+    _resetPendingKey: function () {
+      return 'w3p_reset_pending_' + (this._config && this._config.projectCode || 'unknown');
+    },
+
+    _markResetPending: function () {
+      try {
+        if (window.localStorage) {
+          window.localStorage.setItem(this._resetPendingKey(), String(Date.now()));
+        }
+      } catch (_e) { /* ignore */ }
+    },
+
+    _clearResetPending: function () {
+      try {
+        if (window.localStorage) {
+          window.localStorage.removeItem(this._resetPendingKey());
+        }
+      } catch (_e) { /* ignore */ }
+    },
+
+    _isResetPending: function () {
+      try {
+        if (!window.localStorage) return false;
+        var ts = parseInt(window.localStorage.getItem(this._resetPendingKey()), 10);
+        if (!ts) return false;
+        // Stale-safety: expire after 1 hour so a corrupt flag can't pin
+        // the user forever.
+        return (Date.now() - ts) < 3600000;
+      } catch (_e) { return false; }
+    },
+
+    onReset: function () {
+      this._markResetPending();
+      this._currentStep = 0;
+      this._awaitingContinue = false;
+      this._fileStates = {};
+      this._stepChangeDeltas = {};
+      this._hintsUsed = {};
+      this._hintViewedBeforeStepCheck = false;
+      this._finishModalDismissed = false;
+      this.clearSavedState();
+
+      if (typeof this._config.seedEditorFromInitial === 'function') {
+        this._config.seedEditorFromInitial();
+      }
+
+      this._refreshStepBaseline();
+      var prefillSnapshots = this._buildPrefillSnapshots();
+      this._serializeFileStates(prefillSnapshots);
+      this.saveState();
+
+      if (typeof this._config.syncUiStep === 'function') {
+        this._config.syncUiStep(1);
+      } else if (typeof this._config.gotoStep === 'function') {
+        this._config.gotoStep(1);
+      }
+
+      var self = this;
+      this.submitProgress({
+        fileSnapshots: prefillSnapshots,
+        completed: false,
+        reset: true
+      }, function () {
+        // Backend has accepted the reset — the next fetch will return a
+        // clean completion state, so it's safe to drop the local marker.
+        self._clearResetPending();
+      });
+    },
+
+    markWelcomeHidden: function () {
+      this._welcomeHidden = true;
+      this.saveState();
+    }
+  };
+
+  window.ProjectsProgress = ProjectsProgress;
+})();
